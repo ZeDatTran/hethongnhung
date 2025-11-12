@@ -9,9 +9,9 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
-#include "esp_http_server.h" 
+#include "esp_http_server.h"
 #include "driver/gpio.h"
-#include "driver/adc.h"
+#include "esp_adc/adc_oneshot.h"
 #include "dht.h"
 
 // --- Cấu hình Cứng ---
@@ -19,17 +19,17 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-// Cấu hình AP Mode 
+// Cấu hình AP Mode
 #define CONFIG_AP_SSID     "ESp32"
 #define CONFIG_AP_PASSWORD "123456789"
 
 // Cấu hình chân (Pins)
 #define DHT_PIN 4
-#define SOIL_PIN 32
+#define SOIL_PIN ADC_CHANNEL_4
 #define RELAY_PIN 18
 #define BUTTON_PIN 19
 
-// Cấu hình NVS 
+// Cấu hình NVS
 #define NVS_NAMESPACE "storage"
 #define NVS_WIFI_SSID "ssid"
 #define NVS_WIFI_PASS "pass"
@@ -41,7 +41,7 @@
 
 // Giá trị mặc định
 #define DEFAULT_DEVICE_ID "esp32-01"
-#define DEFAULT_DATA_CYCLE_MS 60000 
+#define DEFAULT_DATA_CYCLE_MS 300000 // 5 phút
 
 // --- Biến Global ---
 static const char *TAG = "ESP32_APP";
@@ -58,20 +58,28 @@ static bool auto_enable = false;
 
 // Biến trạng thái
 dht_sensor_type_t sensor_type = DHT_TYPE_DHT11;
-float temperature, humidity;
-int soil_moisture;
+float temperature = 0.0, humidity = 0.0;
+int soil_moisture = 0;
 int relay_state = 0;
+
+// Biến quét WiFi
+static char wifi_list[5][32];
+static int wifi_count = 0;
 
 // Handles
 httpd_handle_t server = NULL;
-static esp_netif_t *s_ap_netif = NULL; 
+static esp_netif_t *s_ap_netif = NULL;
+adc_oneshot_unit_handle_t adc1_handle;
 
 // --- Khai báo hàm (Prototypes) ---
 static void start_webserver();
-static void wifi_transition_task(void *pvParameters); 
+static void stop_webserver();
+static void wifi_transition_task(void *pvParameters);
 static void sensor_task(void *pvParameters);
 static void button_task(void *pvParameters);
+static esp_err_t scan_wifi();
 
+// --- Hàm tiện ích ---
 long map(long x, long in_min, long in_max, long out_min, long out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
@@ -84,17 +92,17 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
         if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
+            ESP_LOGI(TAG, "Retry to connect to the AP");
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
-        ESP_LOGI(TAG,"connect to the AP fail");
+        ESP_LOGI(TAG, "Connect to the AP fail");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        start_webserver(); 
+        start_webserver();
     }
 }
 
@@ -105,7 +113,6 @@ static esp_err_t load_config() {
     if (err != ESP_OK) return err;
 
     size_t len;
-    
     len = sizeof(wifi_ssid);
     if (nvs_get_str(nvs_handle, NVS_WIFI_SSID, wifi_ssid, &len) == ESP_OK) {
         len = sizeof(wifi_password);
@@ -121,9 +128,18 @@ static esp_err_t load_config() {
         data_cycle_ms = DEFAULT_DATA_CYCLE_MS;
     }
 
-    nvs_get_u32(nvs_handle, NVS_SOIL_MIN, (uint32_t*)&soil_min);
-    nvs_get_u32(nvs_handle, NVS_SOIL_MAX, (uint32_t*)&soil_max);
+    if (nvs_get_u32(nvs_handle, NVS_SOIL_MIN, (uint32_t*)&soil_min) != ESP_OK) {
+        soil_min = 40;
+    }
+    if (nvs_get_u32(nvs_handle, NVS_SOIL_MAX, (uint32_t*)&soil_max) != ESP_OK) {
+        soil_max = 60;
+    }
     nvs_get_u8(nvs_handle, NVS_AUTO_ENABLE, (uint8_t*)&auto_enable);
+
+    if (soil_min >= soil_max) {
+        soil_min = 40;
+        soil_max = 60;
+    }
 
     nvs_close(nvs_handle);
     return ESP_OK;
@@ -170,12 +186,12 @@ static void wifi_init_sta() {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "wifi_init_sta finished. Đang chờ kết nối...");
+    ESP_LOGI(TAG, "wifi_init_sta finished. Waiting for connection...");
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "connected to ap SSID:%s", wifi_ssid);
+        ESP_LOGI(TAG, "Connected to AP SSID:%s", wifi_ssid);
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGI(TAG, "Failed to connect to SSID:%s", wifi_ssid);
     } else {
@@ -186,7 +202,7 @@ static void wifi_init_sta() {
 static void wifi_init_ap() {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
+
     s_ap_netif = esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -203,28 +219,45 @@ static void wifi_init_ap() {
     };
     strcpy((char*)wifi_config.ap.ssid, CONFIG_AP_SSID);
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    ESP_ERROR_CHECK(esp_wifi_set_country_code("01", true));
     ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s", CONFIG_AP_SSID, CONFIG_AP_PASSWORD);
 }
 
 // --- Logic Cảm biến & Điều khiển ---
 static void read_sensors() {
-    if (dht_read_float_data(sensor_type, (gpio_num_t)DHT_PIN, &humidity, &temperature) == ESP_OK) {
-        ESP_LOGI(TAG, "Temp: %.1f°C, Hum: %.1f%%", temperature, humidity);
-    } else {
-        ESP_LOGE(TAG, "Failed to read DHT sensor");
+    int retries = 3;
+    while (retries--) {
+        if (dht_read_float_data(sensor_type, (gpio_num_t)DHT_PIN, &humidity, &temperature) == ESP_OK) {
+            ESP_LOGI(TAG, "Temp: %.1f°C, Hum: %.1f%%", temperature, humidity);
+            break;
+        } else {
+            ESP_LOGE(TAG, "Failed to read DHT sensor (retry %d)", retries);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
-    
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_12);
-    int raw = adc1_get_raw(ADC1_CHANNEL_4);
-    soil_moisture = map(raw, 0, 4095, 0, 100); 
-    soil_moisture = (soil_moisture - 100) * -1; 
+    if (retries < 0) {
+        temperature = 0.0;
+        humidity = 0.0;
+    }
 
-    ESP_LOGI(TAG, "Soil: %d%% (Raw: %d)", soil_moisture, raw);
+    int raw = 0;
+    esp_err_t err = adc_oneshot_read(adc1_handle, SOIL_PIN, &raw);
+    if (err == ESP_OK) {
+        soil_moisture = map(raw, 0, 4095, 0, 100);
+        soil_moisture = (soil_moisture - 100) * -1;
+
+        if (soil_moisture < 0) soil_moisture = 0;
+        if (soil_moisture > 100) soil_moisture = 100;
+
+        ESP_LOGI(TAG, "Soil: %d%% (Raw: %d)", soil_moisture, raw);
+    } else {
+        ESP_LOGE(TAG, "Failed to read ADC: %s", esp_err_to_name(err));
+        soil_moisture = 0;
+    }
 }
 
 static void auto_control() {
@@ -244,7 +277,7 @@ static void auto_control() {
 static void button_task(void *pvParameters) {
     gpio_set_direction((gpio_num_t)BUTTON_PIN, GPIO_MODE_INPUT);
     gpio_set_pull_mode((gpio_num_t)BUTTON_PIN, GPIO_PULLUP_ONLY);
-    
+
     int last_state = 1;
     while (1) {
         int state = gpio_get_level((gpio_num_t)BUTTON_PIN);
@@ -268,39 +301,179 @@ static void sensor_task(void *pvParameters) {
     while (1) {
         read_sensors();
         auto_control();
-        vTaskDelay(pdMS_TO_TICKS(2000)); 
+        vTaskDelay(pdMS_TO_TICKS(data_cycle_ms));
     }
 }
 
-// --- Web Server Handlers ---
-static esp_err_t config_get_handler(httpd_req_t *req) {
-    char response[1024]; 
-    snprintf(response, sizeof(response),
-        "<html><head><title>ESP32 Config</title>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "</head><body><h1>ESP32 Config</h1>"
-        "<form method='POST' action='/config'>"
-        "Device ID: <input name='dev_id' value='%s'><br>"
-        "Data Cycle (ms): <input name='cycle' value='%d'><br><hr>"
-        "<b>Auto Control</b><br>"
-        "Soil Min (Turn ON): <input name='min' value='%d'><br>"
-        "Soil Max (Turn OFF): <input name='max' value='%d'><br>"
-        "Auto Enable: <input type='checkbox' name='auto' %s><br><hr>"
-        "<b>WiFi Config</b><br>"
-        "WiFi SSID: <input name='ssid' value='%s'><br>"
-        "WiFi Pass: <input name='pass' type='password' placeholder='********' value='%s'><br>"
-        "<br><input type='submit' value='Save & Connect'>"
-        "</form></body></html>",
-        device_id, data_cycle_ms, soil_min, soil_max, 
-        auto_enable ? "checked" : "", 
-        wifi_ssid, wifi_password); 
+// --- Quét WiFi ---
+static esp_err_t scan_wifi() {
+    wifi_mode_t mode;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get WiFi mode: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "Current WiFi mode: %d", mode);
 
-    httpd_resp_set_type(req, "text/html");
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 120,
+        .scan_time.active.max = 150,
+    };
+
+    err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start WiFi scan: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    uint16_t ap_count = 5;
+    wifi_ap_record_t ap_records[5];
+    err = esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get scan results: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_count = ap_count > 5 ? 5 : ap_count;
+    for (int i = 0; i < wifi_count; i++) {
+        strncpy(wifi_list[i], (char *)ap_records[i].ssid, sizeof(wifi_list[i]));
+        wifi_list[i][31] = '\0';
+        ESP_LOGI(TAG, "Found WiFi: %s", wifi_list[i]);
+    }
+
+    return ESP_OK;
+}
+
+// --- Web Server Handlers ---
+static esp_err_t scan_get_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Handling GET request for /scan");
+    esp_err_t err = scan_wifi();
+    char response[256];
+
+    if (err != ESP_OK) {
+        snprintf(response, sizeof(response), "{\"error\":\"Failed to scan WiFi\"}");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, response, strlen(response));
+        return ESP_OK;
+    }
+
+    int offset = snprintf(response, sizeof(response), "{\"wifi\":[");
+
+    for (int i = 0; i < wifi_count; i++) {
+        offset += snprintf(response + offset, sizeof(response) - offset,
+                          "\"%s\"%s", wifi_list[i], (i < wifi_count - 1) ? "," : "");
+    }
+    offset += snprintf(response + offset, sizeof(response) - offset, "]}");
+
+    httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, strlen(response));
     return ESP_OK;
 }
 
+static esp_err_t config_get_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Handling GET request for /");
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "Free heap before response: %d bytes", free_heap);
+
+    char response[4096];
+    int len = snprintf(response, sizeof(response),
+        "<html><head><title>ESP32 Config</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<style>"
+        "body{font-family:Arial;background:#f4f4f4;margin:0;padding:20px}"
+        ".container{max-width:800px;margin:auto}"
+        ".card{background:white;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-bottom:20px;padding:20px}"
+        ".card h2{margin-top:0;color:#333;border-bottom:1px solid #ddd;padding-bottom:10px}"
+        "label{display:block;margin-bottom:5px;font-weight:bold}"
+        "input[type='text'],input[type='password'],input[type='number'],select{width:100%%;padding:8px;margin-bottom:15px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box}"
+        "input[type='checkbox']{margin-right:10px}"
+        "button{background:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;font-size:16px}"
+        "button:hover{background:#45a049}"
+        "#password-card{display:none}"
+        "@media (max-width:600px){.card{padding:15px}}"
+        "</style>"
+        "<script>"
+        "function scanWiFi(){"
+        "fetch('/scan').then(r=>r.json()).then(d=>{"
+        "let s=document.getElementById('wifi-select');"
+        "s.innerHTML='<option value=\"\">Select a WiFi network</option>';"
+        "if(d.error){alert(d.error);return}"
+        "d.wifi.forEach(ssid=>{s.innerHTML+=`<option value=\"${ssid}\">${ssid}</option>`})"
+        "}).catch(e=>alert('Failed to scan WiFi'))}"
+        "function showPasswordCard(){"
+        "let s=document.getElementById('wifi-select').value;"
+        "let c=document.getElementById('password-card');"
+        "let i=document.getElementById('selected-ssid');"
+        "if(s){i.value=s;c.style.display='block'}else{c.style.display='none'}}"
+        "function validateForm(){"
+        "let p=document.getElementById('selected-pass')?.value||document.getElementById('pass').value;"
+        "if(!p){alert('Please enter a WiFi password');return false}return true}"
+        "</script>"
+        "</head><body>"
+        "<div class='container'>"
+        "<h1 style='text-align:center;color:#333'>ESP32 Configuration</h1>"
+        "<form method='POST' action='/config' onsubmit='return validateForm()'>"
+        "<div class='card'>"
+        "<h2>Device Configuration</h2>"
+        "<label for='dev_id'>Device ID:</label>"
+        "<input type='text' id='dev_id' name='dev_id' value='%s' placeholder='Example: esp32-01'>"
+        "<label for='cycle'>Data Cycle (ms):</label>"
+        "<input type='number' id='cycle' name='cycle' value='%d' placeholder='Example: 60000'>"
+        "</div>"
+        "<div class='card'>"
+        "<h2>Automatic Control</h2>"
+        "<label for='min'>Soil Min (Turn ON):</label>"
+        "<input type='number' id='min' name='min' value='%d' placeholder='Example: 40'>"
+        "<label for='max'>Soil Max (Turn OFF):</label>"
+        "<input type='number' id='max' name='max' value='%d' placeholder='Example: 60'>"
+        "<label for='auto'>Enable Auto Control:</label>"
+        "<input type='checkbox' id='auto' name='auto' %s>"
+        "</div>"
+        "<div class='card'>"
+        "<h2>WiFi Configuration</h2>"
+        "<button type='button' onclick='scanWiFi()'>Scan WiFi</button>"
+        "<label for='wifi-select'>Available WiFi Networks:</label>"
+        "<select id='wifi-select' onchange='showPasswordCard()'>"
+        "<option value=''>Select a WiFi network</option>"
+        "</select>"
+        "<div id='password-card' class='card'>"
+        "<h2>Enter WiFi Password</h2>"
+        "<input type='hidden' id='selected-ssid' name='ssid'>"
+        "<label for='selected-pass'>Password:</label>"
+        "<input type='password' id='selected-pass' name='pass' placeholder='WiFi Password'>"
+        "<button type='submit'>Connect</button>"
+        "</div>"
+        "<h3>Or Enter Manually</h3>"
+        "<label for='ssid'>WiFi SSID:</label>"
+        "<input type='text' id='ssid' name='ssid' value='%s' placeholder='WiFi Network Name'>"
+        "<label for='pass'>WiFi Password:</label>"
+        "<input type='password' id='pass' name='pass' value='%s' placeholder='WiFi Password'>"
+        "</div>"
+        "<button type='submit' style='width:100%%'>Save & Connect</button>"
+        "</form></div></body></html>",
+        device_id, data_cycle_ms, soil_min, soil_max,
+        auto_enable ? "checked" : "",
+        wifi_ssid, wifi_password);
+
+    ESP_LOGI(TAG, "Response length: %d", len);
+    if (len >= sizeof(response)) {
+        ESP_LOGE(TAG, "Response buffer overflow");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, response, len);
+    return ESP_OK;
+}
+
 static esp_err_t config_post_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Handling POST request for /config");
     char* buf = NULL;
     size_t buf_len = req->content_len;
 
@@ -323,15 +496,15 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
         free(buf);
         return ESP_FAIL;
     }
-    buf[ret] = '\0'; 
+    buf[ret] = '\0';
 
-    char param[64]; 
-
+    char param[64];
     if (httpd_query_key_value(buf, "dev_id", param, sizeof(param)) == ESP_OK) {
         strncpy(device_id, param, sizeof(device_id) - 1);
     }
     if (httpd_query_key_value(buf, "cycle", param, sizeof(param)) == ESP_OK) {
         data_cycle_ms = atoi(param);
+        if (data_cycle_ms < 1000) data_cycle_ms = 1000;
     }
     if (httpd_query_key_value(buf, "min", param, sizeof(param)) == ESP_OK) {
         soil_min = atoi(param);
@@ -348,15 +521,20 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 
     auto_enable = (httpd_query_key_value(buf, "auto", param, sizeof(param)) == ESP_OK);
 
+    if (soil_min >= soil_max) {
+        soil_min = 40;
+        soil_max = 60;
+    }
+
     free(buf);
 
     save_config();
     ESP_LOGI(TAG, "Config saved. Starting WiFi transition...");
-    
+
     const char* resp_msg = "<html><body><h1>Configuration received.</h1>"
-                            "<h2>Turning off AP and attempting to connect to <b>%s</b>...</h2>"
-                            "<p>You can close this page. If the connection is successful, "
-                            "the device will get a new IP address.</p></body></html>";
+                           "<h2>Turning off AP and attempting to connect to <b>%s</b>...</h2>"
+                           "<p>You can close this page. If the connection is successful, "
+                           "the device will get a new IP address.</p></body></html>";
     char resp_buffer[256];
     snprintf(resp_buffer, sizeof(resp_buffer), resp_msg, wifi_ssid);
     httpd_resp_send(req, resp_buffer, strlen(resp_buffer));
@@ -366,43 +544,65 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t data_get_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Handling GET request for /data");
+    char response[256];
+    snprintf(response, sizeof(response),
+             "{\"temp\":%.1f,\"hum\":%.1f,\"soil\":%d,\"relay\":%d}",
+             temperature, humidity, soil_moisture, relay_state);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, strlen(response));
+    return ESP_OK;
+}
+
 // --- Tác vụ Chuyển đổi WiFi ---
 static void wifi_transition_task(void *pvParameters) {
     ESP_LOGI(TAG, "Transition task started.");
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    if (server) {
-        ESP_LOGI(TAG, "Stopping web server...");
-        httpd_stop(server);
-        server = NULL;
-    }
+    stop_webserver();
 
     ESP_LOGI(TAG, "Stopping AP mode and cleaning up...");
     ESP_ERROR_CHECK(esp_wifi_stop());
     if (s_ap_netif) {
-        esp_netif_destroy(s_ap_netif);
+        esp_netif_destroy_default_wifi(s_ap_netif);
         s_ap_netif = NULL;
     }
-    
+    esp_event_loop_delete_default();
+    esp_netif_deinit();
+
     ESP_LOGI(TAG, "Initializing STA mode...");
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_init_sta();
 
     EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "STA Connected. Starting main tasks.");
-        xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+        xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 6, NULL);
         xTaskCreate(button_task, "button_task", 2048, NULL, 4, NULL);
+        // Không khởi tạo data_send_task vì chưa muốn gửi dữ liệu
+        // xTaskCreate(data_send_task, "data_send_task", 4096, NULL, 3, NULL);
     } else {
         ESP_LOGE(TAG, "Failed to connect to STA. Restarting in 10s...");
         vTaskDelay(pdMS_TO_TICKS(10000));
-        esp_restart(); 
+        esp_restart();
     }
 
     ESP_LOGI(TAG, "Transition task finished. Deleting self.");
     vTaskDelete(NULL);
 }
 
-// --- Khởi động Web Server ---
+// --- Khởi động/Dừng Web Server ---
+static void stop_webserver() {
+    if (server) {
+        ESP_LOGI(TAG, "Stopping web server...");
+        httpd_stop(server);
+        server = NULL;
+    }
+}
+
 static void start_webserver() {
     if (server != NULL) {
         ESP_LOGW(TAG, "Web server already running.");
@@ -411,6 +611,8 @@ static void start_webserver() {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
+    config.stack_size = 8192;
+    config.max_open_sockets = 4;
 
     httpd_uri_t config_uri = {
         .uri       = "/",
@@ -422,11 +624,23 @@ static void start_webserver() {
         .method    = HTTP_POST,
         .handler   = config_post_handler,
     };
+    httpd_uri_t data_uri = {
+        .uri       = "/data",
+        .method    = HTTP_GET,
+        .handler   = data_get_handler,
+    };
+    httpd_uri_t scan_uri = {
+        .uri       = "/scan",
+        .method    = HTTP_GET,
+        .handler   = scan_get_handler,
+    };
 
     ESP_LOGI(TAG, "Starting web server on port: %d", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &config_uri);
         httpd_register_uri_handler(server, &config_post);
+        httpd_register_uri_handler(server, &data_uri);
+        httpd_register_uri_handler(server, &scan_uri);
     } else {
         ESP_LOGE(TAG, "Failed to start web server");
     }
@@ -440,11 +654,22 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    load_config(); 
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
 
-    ESP_LOGI(TAG, "Khởi động ở chế độ AP để chờ cấu hình.");
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, SOIL_PIN, &config));
+
+    load_config();
+
+    ESP_LOGI(TAG, "Starting in AP mode for configuration.");
     wifi_init_ap();
     start_webserver();
 
-    ESP_LOGI(TAG, "Hệ thống đã sẵn sàng. Truy cập http://192.168.4.1 để cấu hình.");
+    ESP_LOGI(TAG, "System ready. Access http://192.168.4.1 to configure.");
 }
