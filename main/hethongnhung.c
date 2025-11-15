@@ -350,6 +350,77 @@ static esp_err_t scan_wifi() {
 }
 
 // --- Web Server Handlers ---
+
+// *** BẮT ĐẦU THAY ĐỔI 1: THÊM HANDLER /save-settings ***
+static esp_err_t save_settings_post_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Handling POST request for /save-settings");
+    char* buf = NULL;
+    size_t buf_len = req->content_len;
+
+    if (buf_len <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    buf = malloc(buf_len + 1);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    int ret = httpd_req_recv(req, buf, buf_len);
+    if (ret <= 0) {
+        free(buf);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char param[64];
+    if (httpd_query_key_value(buf, "dev_id", param, sizeof(param)) == ESP_OK) {
+        strncpy(device_id, param, sizeof(device_id) - 1);
+        ESP_LOGI(TAG, "Updated dev_id: %s", device_id); // Log thay đổi
+    }
+    if (httpd_query_key_value(buf, "cycle", param, sizeof(param)) == ESP_OK) {
+        data_cycle_ms = atoi(param);
+        if (data_cycle_ms < 1000) data_cycle_ms = 1000;
+        ESP_LOGI(TAG, "Updated cycle: %d", data_cycle_ms); // Log thay đổi
+    }
+    if (httpd_query_key_value(buf, "min", param, sizeof(param)) == ESP_OK) {
+        soil_min = atoi(param);
+        ESP_LOGI(TAG, "Updated min: %d", soil_min); // Log thay đổi
+    }
+    if (httpd_query_key_value(buf, "max", param, sizeof(param)) == ESP_OK) {
+        soil_max = atoi(param);
+        ESP_LOGI(TAG, "Updated max: %d", soil_max); // Log thay đổi
+    }
+
+    // Xử lý checkbox 'auto'
+    if (httpd_query_key_value(buf, "section", param, sizeof(param)) == ESP_OK && strcmp(param, "auto") == 0) {
+       // Nếu là section 'auto', chúng ta kiểm tra sự tồn tại của key 'auto'
+       auto_enable = (httpd_query_key_value(buf, "auto", param, sizeof(param)) == ESP_OK);
+       ESP_LOGI(TAG, "Updated auto_enable: %d", auto_enable); // Log thay đổi
+    }
+
+
+    if (soil_min >= soil_max) {
+        soil_min = 40;
+        soil_max = 60;
+    }
+
+    free(buf);
+
+    save_config(); // Lưu cấu hình vào NVS
+    ESP_LOGI(TAG, "Config saved (partial update)."); // Log xác nhận lưu
+
+    // Trả về JSON thành công
+    httpd_resp_set_type(req, "application/json");
+    const char* resp = "{\"status\":\"success\"}";
+    httpd_resp_send(req, resp, strlen(resp));
+
+    return ESP_OK;
+}
+// *** KẾT THÚC THAY ĐỔI 1 ***
+
 static esp_err_t scan_get_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling GET request for /scan");
     esp_err_t err = scan_wifi();
@@ -375,12 +446,14 @@ static esp_err_t scan_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// *** BẮT ĐẦU THAY ĐỔI 2: CẬP NHẬT HANDLER / (GET) ***
 static esp_err_t config_get_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling GET request for /");
     size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     ESP_LOGI(TAG, "Free heap before response: %d bytes", free_heap);
 
-    char response[4096];
+    // Tăng kích thước buffer để chứa thêm JS/CSS
+    char response[5120]; 
     int len = snprintf(response, sizeof(response),
         "<html><head><title>ESP32 Config</title>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -394,7 +467,10 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "input[type='checkbox']{margin-right:10px}"
         "button{background:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;font-size:16px}"
         "button:hover{background:#45a049}"
+        ".btn-save{background:#007BFF;margin-top:10px}" // CSS cho nút save mới
+        ".btn-save:hover{background:#0056b3}"
         "#password-card{display:none}"
+        ".toast{position:fixed;top:20px;right:20px;background:#4CAF50;color:white;padding:15px;border-radius:5px;z-index:1000;display:none;box-shadow:0 2px 5px rgba(0,0,0,0.2)}" // CSS cho thông báo
         "@media (max-width:600px){.card{padding:15px}}"
         "</style>"
         "<script>"
@@ -413,18 +489,66 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "function validateForm(){"
         "let p=document.getElementById('selected-pass')?.value||document.getElementById('pass').value;"
         "if(!p){alert('Please enter a WiFi password');return false}return true}"
+        
+        // --- JS MỚI ĐƯỢC THÊM ---
+        "function showToast(){"
+        "let t=document.getElementById('toast-success');"
+        "t.style.display='block';"
+        "setTimeout(()=>{t.style.display='none'}, 3000);"
+        "}"
+        
+        "function saveSettings(section){"
+        "let formData = new URLSearchParams();"
+        "formData.append('section', section);" // Gửi tên section để server biết
+        
+        "if(section === 'device'){"
+        "formData.append('dev_id', document.getElementById('dev_id').value);"
+        "formData.append('cycle', document.getElementById('cycle').value);"
+        "} else if (section === 'auto'){"
+        "formData.append('min', document.getElementById('min').value);"
+        "formData.append('max', document.getElementById('max').value);"
+        "if(document.getElementById('auto').checked){"
+        "formData.append('auto', 'on');"
+        "}"
+        "}"
+        
+        "fetch('/save-settings', {"
+        "method: 'POST',"
+        "headers: { 'Content-Type': 'application/x-www-form-urlencoded' },"
+        "body: formData"
+        "})"
+        ".then(response => response.json())"
+        ".then(data => {"
+        "if(data.status === 'success'){"
+        "showToast();"
+        "} else {"
+        "alert('Failed to save settings.');"
+        "}"
+        "})"
+        ".catch(e => alert('Error: ' + e));"
+        "}"
+        // --- KẾT THÚC JS MỚI ---
+        
         "</script>"
         "</head><body>"
+        // --- HTML MỚI: Card thông báo ---
+        "<div id='toast-success' class='toast'>Settings saved successfully!</div>"
+        
         "<div class='container'>"
         "<h1 style='text-align:center;color:#333'>ESP32 Configuration</h1>"
+        // Form chính vẫn cần để POST WiFi
         "<form method='POST' action='/config' onsubmit='return validateForm()'>"
+        
         "<div class='card'>"
         "<h2>Device Configuration</h2>"
         "<label for='dev_id'>Device ID:</label>"
         "<input type='text' id='dev_id' name='dev_id' value='%s' placeholder='Example: esp32-01'>"
         "<label for='cycle'>Data Cycle (ms):</label>"
         "<input type='number' id='cycle' name='cycle' value='%d' placeholder='Example: 60000'>"
+        // NÚT SAVE MỚI 1
+        "<button type='button' class='btn-save' onclick='saveSettings(\"device\")'>Save Device Settings</button>"
         "</div>"
+        
         "<div class='card'>"
         "<h2>Automatic Control</h2>"
         "<label for='min'>Soil Min (Turn ON):</label>"
@@ -433,7 +557,11 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "<input type='number' id='max' name='max' value='%d' placeholder='Example: 60'>"
         "<label for='auto'>Enable Auto Control:</label>"
         "<input type='checkbox' id='auto' name='auto' %s>"
+        // NÚT SAVE MỚI 2
+        "<button type='button' class='btn-save' onclick='saveSettings(\"auto\")'>Save Auto Settings</button>"
         "</div>"
+        
+        // Phần WiFi giữ nguyên
         "<div class='card'>"
         "<h2>WiFi Configuration</h2>"
         "<button type='button' onclick='scanWiFi()'>Scan WiFi</button>"
@@ -454,7 +582,9 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "<label for='pass'>WiFi Password:</label>"
         "<input type='password' id='pass' name='pass' value='%s' placeholder='WiFi Password'>"
         "</div>"
-        "<button type='submit' style='width:100%%'>Save & Connect</button>"
+        
+        // Nút 'submit' chính vẫn điều khiển WiFi
+        "<button type='submit' style='width:100%%'>Save & Connect to WiFi</button>"
         "</form></div></body></html>",
         device_id, data_cycle_ms, soil_min, soil_max,
         auto_enable ? "checked" : "",
@@ -471,6 +601,7 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
     httpd_resp_send(req, response, len);
     return ESP_OK;
 }
+// *** KẾT THÚC THAY ĐỔI 2 ***
 
 static esp_err_t config_post_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling POST request for /config");
@@ -582,8 +713,6 @@ static void wifi_transition_task(void *pvParameters) {
         ESP_LOGI(TAG, "STA Connected. Starting main tasks.");
         xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 6, NULL);
         xTaskCreate(button_task, "button_task", 2048, NULL, 4, NULL);
-        // Không khởi tạo data_send_task vì chưa muốn gửi dữ liệu
-        // xTaskCreate(data_send_task, "data_send_task", 4096, NULL, 3, NULL);
     } else {
         ESP_LOGE(TAG, "Failed to connect to STA. Restarting in 10s...");
         vTaskDelay(pdMS_TO_TICKS(10000));
@@ -603,6 +732,7 @@ static void stop_webserver() {
     }
 }
 
+// *** BẮT ĐẦU THAY ĐỔI 3: CẬP NHẬT start_webserver ***
 static void start_webserver() {
     if (server != NULL) {
         ESP_LOGW(TAG, "Web server already running.");
@@ -634,6 +764,13 @@ static void start_webserver() {
         .method    = HTTP_GET,
         .handler   = scan_get_handler,
     };
+    
+    // Thêm URI cho handler save-settings mới
+    httpd_uri_t save_settings_post = {
+        .uri       = "/save-settings",
+        .method    = HTTP_POST,
+        .handler   = save_settings_post_handler,
+    };
 
     ESP_LOGI(TAG, "Starting web server on port: %d", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -641,10 +778,13 @@ static void start_webserver() {
         httpd_register_uri_handler(server, &config_post);
         httpd_register_uri_handler(server, &data_uri);
         httpd_register_uri_handler(server, &scan_uri);
+        // Đăng ký handler mới
+        httpd_register_uri_handler(server, &save_settings_post);
     } else {
         ESP_LOGE(TAG, "Failed to start web server");
     }
 }
+// *** KẾT THÚC THAY ĐỔI 3 ***
 
 void app_main(void) {
     esp_err_t ret = nvs_flash_init();
