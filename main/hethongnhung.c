@@ -350,8 +350,6 @@ static esp_err_t scan_wifi() {
 }
 
 // --- Web Server Handlers ---
-
-// *** BẮT ĐẦU THAY ĐỔI 1: THÊM HANDLER /save-settings ***
 static esp_err_t save_settings_post_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling POST request for /save-settings");
     char* buf = NULL;
@@ -419,7 +417,6 @@ static esp_err_t save_settings_post_handler(httpd_req_t *req) {
 
     return ESP_OK;
 }
-// *** KẾT THÚC THAY ĐỔI 1 ***
 
 static esp_err_t scan_get_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling GET request for /scan");
@@ -446,7 +443,6 @@ static esp_err_t scan_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// *** BẮT ĐẦU THAY ĐỔI 2: CẬP NHẬT HANDLER / (GET) ***
 static esp_err_t config_get_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling GET request for /");
     size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
@@ -467,7 +463,7 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "input[type='checkbox']{margin-right:10px}"
         "button{background:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;font-size:16px}"
         "button:hover{background:#45a049}"
-        ".btn-save{background:#007BFF;margin-top:10px}" // CSS cho nút save mới
+        ".btn-save{background:#007BFF;margin-top:10px}" 
         ".btn-save:hover{background:#0056b3}"
         "#password-card{display:none}"
         ".toast{position:fixed;top:20px;right:20px;background:#4CAF50;color:white;padding:15px;border-radius:5px;z-index:1000;display:none;box-shadow:0 2px 5px rgba(0,0,0,0.2)}" // CSS cho thông báo
@@ -499,7 +495,7 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         
         "function saveSettings(section){"
         "let formData = new URLSearchParams();"
-        "formData.append('section', section);" // Gửi tên section để server biết
+        "formData.append('section', section);" 
         
         "if(section === 'device'){"
         "formData.append('dev_id', document.getElementById('dev_id').value);"
@@ -531,7 +527,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         
         "</script>"
         "</head><body>"
-        // --- HTML MỚI: Card thông báo ---
         "<div id='toast-success' class='toast'>Settings saved successfully!</div>"
         
         "<div class='container'>"
@@ -561,7 +556,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "<button type='button' class='btn-save' onclick='saveSettings(\"auto\")'>Save Auto Settings</button>"
         "</div>"
         
-        // Phần WiFi giữ nguyên
         "<div class='card'>"
         "<h2>WiFi Configuration</h2>"
         "<button type='button' onclick='scanWiFi()'>Scan WiFi</button>"
@@ -601,7 +595,7 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
     httpd_resp_send(req, response, len);
     return ESP_OK;
 }
-// *** KẾT THÚC THAY ĐỔI 2 ***
+
 
 static esp_err_t config_post_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling POST request for /config");
@@ -731,8 +725,6 @@ static void stop_webserver() {
         server = NULL;
     }
 }
-
-// *** BẮT ĐẦU THAY ĐỔI 3: CẬP NHẬT start_webserver ***
 static void start_webserver() {
     if (server != NULL) {
         ESP_LOGW(TAG, "Web server already running.");
@@ -784,7 +776,6 @@ static void start_webserver() {
         ESP_LOGE(TAG, "Failed to start web server");
     }
 }
-// *** KẾT THÚC THAY ĐỔI 3 ***
 
 void app_main(void) {
     esp_err_t ret = nvs_flash_init();
