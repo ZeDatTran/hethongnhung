@@ -50,7 +50,7 @@
 #define DEFAULT_DEVICE_ID "esp32-01"
 #define DEFAULT_DATA_CYCLE_MS 2000 
 
-// --- Biến Global (Giữ nguyên) ---
+// --- Biến Global (Giữ nguyên) ---5
 static const char *TAG = "ESP32_APP";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
