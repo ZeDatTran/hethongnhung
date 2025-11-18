@@ -1,0 +1,19 @@
+{
+  "devices": {
+    "esp32_01": {
+      "config": {
+        "auto_en": false,
+        "cycle": 2000,
+        "relay_cmd": -1,
+        "soil_max": 60,
+        "soil_min": 40
+      },
+      "status": {
+        "hum": 0,
+        "relay_state": 0,
+        "soil": 0,
+        "temp": 0
+      }
+    }
+  }
+}

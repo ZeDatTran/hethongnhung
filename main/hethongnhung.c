@@ -13,8 +13,15 @@
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "dht.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "cJSON.h"
 
-// --- Cấu hình Cứng ---
+// --- [THÊM MỚI] Cấu hình Firebase ---
+#define FIREBASE_HOST "https://esp32-a12b7-default-rtdb.firebaseio.com/" // Đổi link này
+#define FIREBASE_AUTH "6TlmDfBAZ9j4Q9SffYRWQLfsWt59vlPWpCO5CQP9" // Đổi token này
+
+// --- Cấu hình Cứng (Giữ nguyên) ---
 #define EXAMPLE_ESP_MAXIMUM_RETRY   5
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -41,9 +48,9 @@
 
 // Giá trị mặc định
 #define DEFAULT_DEVICE_ID "esp32-01"
-#define DEFAULT_DATA_CYCLE_MS 300000 // 5 phút
+#define DEFAULT_DATA_CYCLE_MS 2000 
 
-// --- Biến Global ---
+// --- Biến Global (Giữ nguyên) ---
 static const char *TAG = "ESP32_APP";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
@@ -78,10 +85,119 @@ static void wifi_transition_task(void *pvParameters);
 static void sensor_task(void *pvParameters);
 static void button_task(void *pvParameters);
 static esp_err_t scan_wifi();
+static esp_err_t save_config();
 
 // --- Hàm tiện ích ---
 long map(long x, long in_min, long in_max, long out_min, long out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
+    static char *output_buffer;  
+    static int output_len;      
+
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        if (evt->user_data) {
+            memcpy(evt->user_data + output_len, evt->data, evt->data_len);
+            output_len += evt->data_len;
+        }
+    } else if (evt->event_id == HTTP_EVENT_ON_FINISH) {
+        output_len = 0;
+    }
+    return ESP_OK;
+}
+
+// 1. Hàm gửi dữ liệu (Push)
+static void firebase_push_data() {
+    char url[512];
+    snprintf(url, sizeof(url), "%s/devices/%s/status.json?auth=%s", 
+             FIREBASE_HOST, device_id, FIREBASE_AUTH);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "temp", temperature);
+    cJSON_AddNumberToObject(root, "hum", humidity);
+    cJSON_AddNumberToObject(root, "soil", soil_moisture);
+    cJSON_AddNumberToObject(root, "relay_state", relay_state);
+    
+    char *post_data = cJSON_PrintUnformatted(root);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_PATCH,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 5000,
+    };
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+    
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Firebase Push OK. Status: %d", esp_http_client_get_status_code(client));
+    } else {
+        ESP_LOGE(TAG, "Firebase Push Failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    cJSON_Delete(root);
+    free(post_data);
+}
+
+// 2. Hàm lấy cấu hình (Pull)
+static void firebase_get_config() {
+    char url[512];
+    char response_buffer[1024] = {0}; // Buffer tạm
+    
+    snprintf(url, sizeof(url), "%s/devices/%s/config.json?auth=%s", 
+             FIREBASE_HOST, device_id, FIREBASE_AUTH);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = _http_event_handler,
+        .user_data = response_buffer, // Truyền buffer vào để hứng dữ liệu
+        .timeout_ms = 5000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = esp_http_client_perform(client);
+
+    if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
+        cJSON *root = cJSON_Parse(response_buffer);
+        if (root) {
+            // Cập nhật Auto
+            cJSON *j_auto = cJSON_GetObjectItem(root, "auto_en");
+            if (cJSON_IsBool(j_auto)) auto_enable = cJSON_IsTrue(j_auto);
+            
+            // Cập nhật Min/Max
+            cJSON *j_min = cJSON_GetObjectItem(root, "soil_min");
+            if (cJSON_IsNumber(j_min)) soil_min = j_min->valueint;
+            cJSON *j_max = cJSON_GetObjectItem(root, "soil_max");
+            if (cJSON_IsNumber(j_max)) soil_max = j_max->valueint;
+
+            // Cập nhật chu kỳ
+            cJSON *j_cycle = cJSON_GetObjectItem(root, "cycle");
+            if (cJSON_IsNumber(j_cycle) && j_cycle->valueint >= 1000) data_cycle_ms = j_cycle->valueint;
+
+            // Điều khiển Relay từ web (Chỉ khi tắt Auto)
+            cJSON *j_cmd = cJSON_GetObjectItem(root, "relay_cmd");
+            if (cJSON_IsNumber(j_cmd) && !auto_enable) {
+                if (j_cmd->valueint == 1) {
+                    relay_state = 1;
+                    gpio_set_level((gpio_num_t)RELAY_PIN, 1);
+                } else if (j_cmd->valueint == 0) {
+                    relay_state = 0;
+                    gpio_set_level((gpio_num_t)RELAY_PIN, 0);
+                }
+            }
+            cJSON_Delete(root);
+        }
+    }
+    esp_http_client_cleanup(client);
 }
 
 // --- Xử lý sự kiện WiFi ---
@@ -163,7 +279,7 @@ static esp_err_t save_config() {
     return err;
 }
 
-// --- Khởi tạo WiFi ---
+// --- Khởi tạo WiFi  ---
 static void wifi_init_sta() {
     s_wifi_event_group = xEventGroupCreate();
     esp_netif_create_default_wifi_sta();
@@ -294,14 +410,34 @@ static void button_task(void *pvParameters) {
     }
 }
 
+// --- [ĐÃ SỬA ĐỔI] Sensor Task tích hợp Firebase ---
 static void sensor_task(void *pvParameters) {
     gpio_set_direction((gpio_num_t)RELAY_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level((gpio_num_t)RELAY_PIN, relay_state);
 
+    uint32_t last_push_time = 0;
+    // Kiểm tra lệnh từ Firebase mỗi 2 giây
+    const uint32_t control_interval = 2000; 
+
     while (1) {
         read_sensors();
+        
+        // 1. Lấy lệnh điều khiển
+        firebase_get_config();
+
+        // 2. Chạy logic tự động
         auto_control();
-        vTaskDelay(pdMS_TO_TICKS(data_cycle_ms));
+
+        // 3. Gửi dữ liệu lên Firebase
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if ((now - last_push_time) >= data_cycle_ms) {
+            ESP_LOGI(TAG, "Uploading data to Firebase...");
+            firebase_push_data();
+            last_push_time = now;
+        }
+        
+        // Thay vì ngủ data_cycle_ms, ta ngủ ngắn để nhận lệnh nhanh hơn
+        vTaskDelay(pdMS_TO_TICKS(control_interval));
     }
 }
 
@@ -349,7 +485,7 @@ static esp_err_t scan_wifi() {
     return ESP_OK;
 }
 
-// --- Web Server Handlers ---
+// --- Web Server Handlers  ---
 static esp_err_t save_settings_post_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling POST request for /save-settings");
     char* buf = NULL;
@@ -376,29 +512,26 @@ static esp_err_t save_settings_post_handler(httpd_req_t *req) {
     char param[64];
     if (httpd_query_key_value(buf, "dev_id", param, sizeof(param)) == ESP_OK) {
         strncpy(device_id, param, sizeof(device_id) - 1);
-        ESP_LOGI(TAG, "Updated dev_id: %s", device_id); // Log thay đổi
+        ESP_LOGI(TAG, "Updated dev_id: %s", device_id);
     }
     if (httpd_query_key_value(buf, "cycle", param, sizeof(param)) == ESP_OK) {
         data_cycle_ms = atoi(param);
         if (data_cycle_ms < 1000) data_cycle_ms = 1000;
-        ESP_LOGI(TAG, "Updated cycle: %d", data_cycle_ms); // Log thay đổi
+        ESP_LOGI(TAG, "Updated cycle: %d", data_cycle_ms);
     }
     if (httpd_query_key_value(buf, "min", param, sizeof(param)) == ESP_OK) {
         soil_min = atoi(param);
-        ESP_LOGI(TAG, "Updated min: %d", soil_min); // Log thay đổi
+        ESP_LOGI(TAG, "Updated min: %d", soil_min);
     }
     if (httpd_query_key_value(buf, "max", param, sizeof(param)) == ESP_OK) {
         soil_max = atoi(param);
-        ESP_LOGI(TAG, "Updated max: %d", soil_max); // Log thay đổi
+        ESP_LOGI(TAG, "Updated max: %d", soil_max);
     }
 
-    // Xử lý checkbox 'auto'
     if (httpd_query_key_value(buf, "section", param, sizeof(param)) == ESP_OK && strcmp(param, "auto") == 0) {
-       // Nếu là section 'auto', chúng ta kiểm tra sự tồn tại của key 'auto'
        auto_enable = (httpd_query_key_value(buf, "auto", param, sizeof(param)) == ESP_OK);
-       ESP_LOGI(TAG, "Updated auto_enable: %d", auto_enable); // Log thay đổi
+       ESP_LOGI(TAG, "Updated auto_enable: %d", auto_enable);
     }
-
 
     if (soil_min >= soil_max) {
         soil_min = 40;
@@ -407,10 +540,9 @@ static esp_err_t save_settings_post_handler(httpd_req_t *req) {
 
     free(buf);
 
-    save_config(); // Lưu cấu hình vào NVS
-    ESP_LOGI(TAG, "Config saved (partial update)."); // Log xác nhận lưu
+    save_config();
+    ESP_LOGI(TAG, "Config saved (partial update).");
 
-    // Trả về JSON thành công
     httpd_resp_set_type(req, "application/json");
     const char* resp = "{\"status\":\"success\"}";
     httpd_resp_send(req, resp, strlen(resp));
@@ -448,7 +580,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
     size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     ESP_LOGI(TAG, "Free heap before response: %d bytes", free_heap);
 
-    // Tăng kích thước buffer để chứa thêm JS/CSS
     char response[5120]; 
     int len = snprintf(response, sizeof(response),
         "<html><head><title>ESP32 Config</title>"
@@ -466,7 +597,7 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         ".btn-save{background:#007BFF;margin-top:10px}" 
         ".btn-save:hover{background:#0056b3}"
         "#password-card{display:none}"
-        ".toast{position:fixed;top:20px;right:20px;background:#4CAF50;color:white;padding:15px;border-radius:5px;z-index:1000;display:none;box-shadow:0 2px 5px rgba(0,0,0,0.2)}" // CSS cho thông báo
+        ".toast{position:fixed;top:20px;right:20px;background:#4CAF50;color:white;padding:15px;border-radius:5px;z-index:1000;display:none;box-shadow:0 2px 5px rgba(0,0,0,0.2)}"
         "@media (max-width:600px){.card{padding:15px}}"
         "</style>"
         "<script>"
@@ -486,7 +617,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "let p=document.getElementById('selected-pass')?.value||document.getElementById('pass').value;"
         "if(!p){alert('Please enter a WiFi password');return false}return true}"
         
-        // --- JS MỚI ĐƯỢC THÊM ---
         "function showToast(){"
         "let t=document.getElementById('toast-success');"
         "t.style.display='block';"
@@ -523,7 +653,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "})"
         ".catch(e => alert('Error: ' + e));"
         "}"
-        // --- KẾT THÚC JS MỚI ---
         
         "</script>"
         "</head><body>"
@@ -531,7 +660,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         
         "<div class='container'>"
         "<h1 style='text-align:center;color:#333'>ESP32 Configuration</h1>"
-        // Form chính vẫn cần để POST WiFi
         "<form method='POST' action='/config' onsubmit='return validateForm()'>"
         
         "<div class='card'>"
@@ -540,7 +668,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "<input type='text' id='dev_id' name='dev_id' value='%s' placeholder='Example: esp32-01'>"
         "<label for='cycle'>Data Cycle (ms):</label>"
         "<input type='number' id='cycle' name='cycle' value='%d' placeholder='Example: 60000'>"
-        // NÚT SAVE MỚI 1
         "<button type='button' class='btn-save' onclick='saveSettings(\"device\")'>Save Device Settings</button>"
         "</div>"
         
@@ -552,7 +679,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "<input type='number' id='max' name='max' value='%d' placeholder='Example: 60'>"
         "<label for='auto'>Enable Auto Control:</label>"
         "<input type='checkbox' id='auto' name='auto' %s>"
-        // NÚT SAVE MỚI 2
         "<button type='button' class='btn-save' onclick='saveSettings(\"auto\")'>Save Auto Settings</button>"
         "</div>"
         
@@ -577,7 +703,6 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         "<input type='password' id='pass' name='pass' value='%s' placeholder='WiFi Password'>"
         "</div>"
         
-        // Nút 'submit' chính vẫn điều khiển WiFi
         "<button type='submit' style='width:100%%'>Save & Connect to WiFi</button>"
         "</form></div></body></html>",
         device_id, data_cycle_ms, soil_min, soil_max,
@@ -594,9 +719,7 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, response, len);
     return ESP_OK;
-}
-
-
+} 
 static esp_err_t config_post_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling POST request for /config");
     char* buf = NULL;
@@ -681,7 +804,6 @@ static esp_err_t data_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// --- Tác vụ Chuyển đổi WiFi ---
 static void wifi_transition_task(void *pvParameters) {
     ESP_LOGI(TAG, "Transition task started.");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -705,7 +827,7 @@ static void wifi_transition_task(void *pvParameters) {
     EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "STA Connected. Starting main tasks.");
-        xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 6, NULL);
+        xTaskCreate(sensor_task, "sensor_task", 8192, NULL, 6, NULL);
         xTaskCreate(button_task, "button_task", 2048, NULL, 4, NULL);
     } else {
         ESP_LOGE(TAG, "Failed to connect to STA. Restarting in 10s...");
@@ -717,7 +839,6 @@ static void wifi_transition_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-// --- Khởi động/Dừng Web Server ---
 static void stop_webserver() {
     if (server) {
         ESP_LOGI(TAG, "Stopping web server...");
@@ -757,7 +878,6 @@ static void start_webserver() {
         .handler   = scan_get_handler,
     };
     
-    // Thêm URI cho handler save-settings mới
     httpd_uri_t save_settings_post = {
         .uri       = "/save-settings",
         .method    = HTTP_POST,
@@ -770,7 +890,6 @@ static void start_webserver() {
         httpd_register_uri_handler(server, &config_post);
         httpd_register_uri_handler(server, &data_uri);
         httpd_register_uri_handler(server, &scan_uri);
-        // Đăng ký handler mới
         httpd_register_uri_handler(server, &save_settings_post);
     } else {
         ESP_LOGE(TAG, "Failed to start web server");
