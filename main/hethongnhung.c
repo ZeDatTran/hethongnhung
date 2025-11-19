@@ -21,8 +21,8 @@
 #define FIREBASE_HOST "https://esp32-a12b7-default-rtdb.firebaseio.com/" // Đổi link này
 #define FIREBASE_AUTH "6TlmDfBAZ9j4Q9SffYRWQLfsWt59vlPWpCO5CQP9" // Đổi token này
 
-// --- Cấu hình Cứng (Giữ nguyên) ---
-#define EXAMPLE_ESP_MAXIMUM_RETRY   5
+// --- Cấu hình Cứng  ---
+#define EXAMPLE_ESP_MAXIMUM_RETRY   5 //số lần kết nối lại tối đa
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
@@ -114,9 +114,9 @@ static void firebase_push_data() {
              FIREBASE_HOST, device_id, FIREBASE_AUTH);
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "temp", temperature);
+    cJSON_AddNumberToObject(root, "temperature", temperature);
     cJSON_AddNumberToObject(root, "hum", humidity);
-    cJSON_AddNumberToObject(root, "soil", soil_moisture);
+    cJSON_AddNumberToObject(root, "soilmoisture", soil_moisture);
     cJSON_AddNumberToObject(root, "relay_state", relay_state);
     
     char *post_data = cJSON_PrintUnformatted(root);
@@ -180,11 +180,11 @@ static void firebase_get_config() {
             if (cJSON_IsNumber(j_max)) soil_max = j_max->valueint;
 
             // Cập nhật chu kỳ
-            cJSON *j_cycle = cJSON_GetObjectItem(root, "cycle");
+            cJSON *j_cycle = cJSON_GetObjectItem(root, "dataCycle");
             if (cJSON_IsNumber(j_cycle) && j_cycle->valueint >= 1000) data_cycle_ms = j_cycle->valueint;
 
             // Điều khiển Relay từ web (Chỉ khi tắt Auto)
-            cJSON *j_cmd = cJSON_GetObjectItem(root, "relay_cmd");
+            cJSON *j_cmd = cJSON_GetObjectItem(root, "pump_state");
             if (cJSON_IsNumber(j_cmd) && !auto_enable) {
                 if (j_cmd->valueint == 1) {
                     relay_state = 1;
