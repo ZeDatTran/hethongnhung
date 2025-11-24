@@ -47,8 +47,9 @@
 #define NVS_AUTO_ENABLE "auto_en"
 
 // Giá trị mặc định
-#define DEFAULT_DEVICE_ID "esp32-01"
+#define DEFAULT_DEVICE_ID "esp32_01"
 #define DEFAULT_DATA_CYCLE_MS 2000
+#define PULL_COOLDOWN_MS 4000 
 
 // --- Biến Global ---
 static const char *TAG = "ESP32_APP";
@@ -79,6 +80,10 @@ httpd_handle_t server = NULL;
 static esp_netif_t *s_ap_netif = NULL;
 adc_oneshot_unit_handle_t adc1_handle;
 
+// [MỚI] Biến theo dõi trạng thái đồng bộ
+static bool relay_state_changed = false;
+static bool config_changed = false;
+static uint32_t last_local_change_time = 0;
 // --- Khai báo hàm (Prototypes) ---
 static void start_webserver();
 static void stop_webserver();
@@ -87,7 +92,27 @@ static void sensor_task(void *pvParameters);
 static void button_task(void *pvParameters);
 static esp_err_t scan_wifi();
 static esp_err_t save_config();
-static void firebase_push_config(); // [MỚI] Thêm hàm push config lên Firebase
+static void firebase_push_config();
+static void firebase_push_data();
+static void firebase_get_config();
+
+// [MỚI] Hàm đồng bộ ngay lập tức (có delay tránh crash)
+static void sync_to_firebase_immediate() {
+    ESP_LOGI(TAG, "🔄 Immediate sync to Firebase triggered");
+    firebase_push_data();
+    vTaskDelay(pdMS_TO_TICKS(200)); // Delay nhỏ giữa 2 request
+    firebase_push_config();
+}
+
+// [MỚI] Hàm thay đổi relay với đồng bộ
+static void set_relay_state(int new_state, const char* source) {
+    if (relay_state != new_state) {
+        relay_state = new_state;
+        gpio_set_level((gpio_num_t)RELAY_PIN, relay_state);
+        relay_state_changed = true;
+        ESP_LOGI(TAG, "⚡ Relay %s by %s", relay_state ? "ON" : "OFF", source);
+    }
+}
 
 // --- Hàm tiện ích ---
 long map(long x, long in_min, long in_max, long out_min, long out_max) {
@@ -119,6 +144,7 @@ static void firebase_push_data() {
     cJSON_AddNumberToObject(root, "hum", humidity);
     cJSON_AddNumberToObject(root, "soilmoisture", soil_moisture);
     cJSON_AddNumberToObject(root, "relay_state", relay_state);
+    cJSON_AddNumberToObject(root, "timestamp", (int)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000));
    
     char *post_data = cJSON_PrintUnformatted(root);
     
@@ -136,9 +162,10 @@ static void firebase_push_data() {
    
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Firebase Push Status OK. Status: %d", esp_http_client_get_status_code(client));
+        ESP_LOGI(TAG, "✅ Firebase Push Status OK. Status: %d", esp_http_client_get_status_code(client));
+        relay_state_changed = false; // Reset flag sau khi đồng bộ thành công
     } else {
-        ESP_LOGE(TAG, "Firebase Push Status Failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "❌ Firebase Push Status Failed: %s", esp_err_to_name(err));
     }
     
     esp_http_client_cleanup(client);
@@ -146,7 +173,7 @@ static void firebase_push_data() {
     free(post_data);
 }
 
-// [MỚI] 2. Hàm gửi cấu hình lên Firebase (Push Config)
+// 2. Hàm gửi cấu hình lên Firebase (Push Config)
 static void firebase_push_config() {
     char url[512];
     snprintf(url, sizeof(url), "%s/devices/%s/config.json?auth=%s",
@@ -175,9 +202,10 @@ static void firebase_push_config() {
    
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Firebase Push Config OK. Status: %d", esp_http_client_get_status_code(client));
+        ESP_LOGI(TAG, "✅ Firebase Push Config OK. Status: %d", esp_http_client_get_status_code(client));
+        config_changed = false; // Reset flag sau khi đồng bộ thành công
     } else {
-        ESP_LOGE(TAG, "Firebase Push Config Failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "❌ Firebase Push Config Failed: %s", esp_err_to_name(err));
     }
     
     esp_http_client_cleanup(client);
@@ -209,31 +237,73 @@ static void firebase_get_config() {
     if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
         cJSON *root = cJSON_Parse(response_buffer);
         if (root) {
+            bool config_updated = false;
+            
+            // Kiểm tra auto_enable
             cJSON *j_auto = cJSON_GetObjectItem(root, "auto_en");
-            if (cJSON_IsBool(j_auto)) auto_enable = cJSON_IsTrue(j_auto);
-           
-            cJSON *j_min = cJSON_GetObjectItem(root, "soil_min");
-            if (cJSON_IsNumber(j_min)) soil_min = j_min->valueint;
-            
-            cJSON *j_max = cJSON_GetObjectItem(root, "soil_max");
-            if (cJSON_IsNumber(j_max)) soil_max = j_max->valueint;
-            
-            cJSON *j_cycle = cJSON_GetObjectItem(root, "dataCycle");
-            if (cJSON_IsNumber(j_cycle) && j_cycle->valueint >= 1000) data_cycle_ms = j_cycle->valueint;
-            
-            cJSON *j_cmd = cJSON_GetObjectItem(root, "pump_state");
-            if (cJSON_IsNumber(j_cmd) && !auto_enable) {
-                if (j_cmd->valueint == 1) {
-                    relay_state = 1;
-                    gpio_set_level((gpio_num_t)RELAY_PIN, 1);
-                } else if (j_cmd->valueint == 0) {
-                    relay_state = 0;
-                    gpio_set_level((gpio_num_t)RELAY_PIN, 0);
+            if (cJSON_IsBool(j_auto)) {
+                bool new_auto = cJSON_IsTrue(j_auto);
+                if (new_auto != auto_enable) {
+                    auto_enable = new_auto;
+                    config_updated = true;
+                    ESP_LOGI(TAG, "🔄 Auto mode changed to: %s", auto_enable ? "ENABLED" : "DISABLED");
                 }
+            }
+           
+            // Kiểm tra soil_min
+            cJSON *j_min = cJSON_GetObjectItem(root, "soil_min");
+            if (cJSON_IsNumber(j_min) && j_min->valueint != soil_min) {
+                soil_min = j_min->valueint;
+                config_updated = true;
+                ESP_LOGI(TAG, "🔄 Soil min changed to: %d", soil_min);
+            }
+            
+            // Kiểm tra soil_max
+            cJSON *j_max = cJSON_GetObjectItem(root, "soil_max");
+            if (cJSON_IsNumber(j_max) && j_max->valueint != soil_max) {
+                soil_max = j_max->valueint;
+                config_updated = true;
+                ESP_LOGI(TAG, "🔄 Soil max changed to: %d", soil_max);
+            }
+            
+            // Kiểm tra dataCycle
+            cJSON *j_cycle = cJSON_GetObjectItem(root, "dataCycle");
+            if (cJSON_IsNumber(j_cycle) && j_cycle->valueint >= 1000) {
+                if (j_cycle->valueint != data_cycle_ms) {
+                    data_cycle_ms = j_cycle->valueint;
+                    config_updated = true;
+                    ESP_LOGI(TAG, "🔄 Data cycle changed to: %d ms", data_cycle_ms);
+                }
+            }
+            
+            // [QUAN TRỌNG] Xử lý pump_state từ Firebase (điều khiển từ xa)
+            cJSON *j_cmd = cJSON_GetObjectItem(root, "pump_state");
+            if (cJSON_IsNumber(j_cmd)) {
+                int firebase_relay_state = j_cmd->valueint;
+                
+                // Chỉ xử lý lệnh khi KHÔNG ở chế độ auto
+                if (!auto_enable && firebase_relay_state != relay_state) {
+                    set_relay_state(firebase_relay_state, "Firebase");
+                    
+                    // Lưu vào NVS để giữ trạng thái sau khi reboot
+                    save_config();
+                    
+                    // Đồng bộ ngay lên status
+                    firebase_push_data();
+                    
+                    ESP_LOGI(TAG, "📱 Remote control: Relay %s", relay_state ? "ON" : "OFF");
+                }
+            }
+            
+            // Nếu có thay đổi config, lưu vào NVS
+            if (config_updated) {
+                save_config();
             }
             
             cJSON_Delete(root);
         }
+    } else {
+        ESP_LOGW(TAG, "⚠️ Failed to get config from Firebase: %s", esp_err_to_name(err));
     }
     esp_http_client_cleanup(client);
 }
@@ -416,60 +486,121 @@ static void read_sensors() {
 static void auto_control() {
     if (auto_enable) {
         if (soil_moisture < soil_min && relay_state == 0) {
-            relay_state = 1;
-            gpio_set_level((gpio_num_t)RELAY_PIN, relay_state);
-            ESP_LOGI(TAG, "Relay ON (auto)");
+            set_relay_state(1, "Auto");
+            relay_state_changed = true;
         } else if (soil_moisture >= soil_max && relay_state == 1) {
-            relay_state = 0;
-            gpio_set_level((gpio_num_t)RELAY_PIN, relay_state);
-            ESP_LOGI(TAG, "Relay OFF (auto)");
+            set_relay_state(0, "Auto");
+            relay_state_changed = true;
         }
     }
 }
 
+// Button task 
 static void button_task(void *pvParameters) {
     gpio_set_direction((gpio_num_t)BUTTON_PIN, GPIO_MODE_INPUT);
     gpio_set_pull_mode((gpio_num_t)BUTTON_PIN, GPIO_PULLUP_ONLY);
     
     int last_state = 1;
+    bool button_pressed = false;
+    
     while (1) {
         int state = gpio_get_level((gpio_num_t)BUTTON_PIN);
-        if (state == 0 && last_state == 1) {
-            vTaskDelay(pdMS_TO_TICKS(200));
+        
+        // Phát hiện nhấn nút (Active Low)
+        if (state == 0 && last_state == 1 && !button_pressed) {
+            vTaskDelay(pdMS_TO_TICKS(50)); 
             if (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) {
-                relay_state = !relay_state;
-                gpio_set_level((gpio_num_t)RELAY_PIN, relay_state);
-                ESP_LOGI(TAG, "Relay %s (button)", relay_state ? "ON" : "OFF");
+                button_pressed = true;
+                ESP_LOGI(TAG, "🔘 Button pressed detected");
+                if (auto_enable) {
+                    auto_enable = false;
+                    config_changed = true;
+                    ESP_LOGI(TAG, "🔧 Auto mode disabled by button press");
+                }
+                
+                set_relay_state(!relay_state, "Button");
+                save_config();
+                
+                relay_state_changed = true;
+                config_changed = true; 
+                last_local_change_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                
+                ESP_LOGI(TAG, "🛡️ Cooldown activated for %d ms", PULL_COOLDOWN_MS);
             }
         }
+        
+        // Phát hiện nhả nút
+        if (state == 1 && last_state == 0) {
+            button_pressed = false;
+        }
+        
         last_state = state;
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(20)); // Giảm tải CPU
     }
 }
-
+// Sensor task
 static void sensor_task(void *pvParameters) {
+    // Cấu hình chân Relay
     gpio_set_direction((gpio_num_t)RELAY_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level((gpio_num_t)RELAY_PIN, relay_state);
     
     uint32_t last_push_time = 0;
-    const uint32_t control_interval = 2000;
+    uint32_t last_config_pull = 0;
+    
+    // Cấu hình thời gian 
+    const uint32_t control_interval = 100;    
+    const uint32_t config_pull_interval = 1000; 
+    
+    // Đợi WiFi ổn định
+    ESP_LOGI(TAG, "⏳ Waiting for WiFi to stabilize...");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    
+    // Đồng bộ lần đầu
+    ESP_LOGI(TAG, "🚀 Initial Firebase sync...");
+    firebase_push_config();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    firebase_push_data();
     
     while (1) {
-        read_sensors();
-        firebase_get_config();
-        auto_control();
-        
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if ((now - last_push_time) >= data_cycle_ms) {
-            ESP_LOGI(TAG, "Uploading data to Firebase...");
+        
+        read_sensors();
+        
+        auto_control();
+        if (relay_state_changed || config_changed) {
+            ESP_LOGI(TAG, "📤 Local change detected. Executing Immediate Push...");
+            
+            // Cập nhật lại thời gian thay đổi để duy trì Cooldown
+            last_local_change_time = now;
             firebase_push_data();
-            last_push_time = now;
+            if (config_changed) {
+                vTaskDelay(pdMS_TO_TICKS(100)); // Delay nhỏ an toàn
+                firebase_push_config();
+            }
+            
+            // Reset cờ
+            relay_state_changed = false;
+            config_changed = false;
+            last_config_pull = now;
+        } 
+        
+        else {
+            // Kiểm tra xem có đang trong thời gian "Cooldown" không?
+            bool in_cooldown = (now - last_local_change_time) < PULL_COOLDOWN_MS;
+            if (!in_cooldown && (now - last_config_pull) >= config_pull_interval) {
+                // ESP_LOGI(TAG, "⬇️ Checking remote commands..."); // (Bỏ comment nếu muốn debug)
+                firebase_get_config();
+                last_config_pull = now;
+            }
+            if ((now - last_push_time) >= data_cycle_ms) {
+                firebase_push_data();
+                last_push_time = now;
+            }
         }
         
         vTaskDelay(pdMS_TO_TICKS(control_interval));
     }
 }
-
 // --- Quét WiFi ---
 static esp_err_t scan_wifi() {
     wifi_mode_t mode;
@@ -507,7 +638,6 @@ static esp_err_t scan_wifi() {
 
 // --- Web Server Handlers ---
 
-// [SỬA] Handler lưu cấu hình + đồng bộ lên Firebase
 static esp_err_t save_settings_post_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling POST request for /save-settings");
     
@@ -565,17 +695,19 @@ static esp_err_t save_settings_post_handler(httpd_req_t *req) {
     // Lưu vào NVS
     save_config();
     
-    // [MỚI] Đồng bộ lên Firebase
-    firebase_push_config();
+    // Đánh dấu config đã thay đổi (sensor_task sẽ xử lý)
+    config_changed = true;
     
+    // Trả response ngay, đồng bộ Firebase sẽ do sensor_task làm
     httpd_resp_set_type(req, "application/json");
     const char* resp = "{\"status\":\"success\"}";
     httpd_resp_send(req, resp, strlen(resp));
     
+    ESP_LOGI(TAG, "✅ Settings saved, will sync to Firebase in next cycle");
+    
     return ESP_OK;
 }
 
-// [SỬA] Trả về JSON có RSSI
 static esp_err_t scan_get_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling GET request for /scan");
     
@@ -603,7 +735,6 @@ static esp_err_t scan_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// [SỬA] Giao diện HTML với icon WiFi đúng + thêm lại phần nhập manual
 static esp_err_t config_get_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Handling GET request for /");
    
@@ -633,6 +764,8 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         ".wifi-row:hover{background:#f0f8ff}"
         ".wifi-signal{font-size:20px;margin-right:10px}"
         ".manual-section{margin-top:15px;padding-top:15px;border-top:2px dashed #ccc}"
+        ".status-badge{display:inline-block;padding:5px 10px;border-radius:4px;font-size:12px;font-weight:bold;margin-left:10px}"
+        ".status-synced{background:#28a745;color:white}"
         "</style>"
         "<script>"
         "function getSignalIcon(rssi){"
@@ -696,14 +829,16 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         " }"
         " fetch('/save-settings', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData})"
         " .then(r=>r.json()).then(d=>{"
-        " if(d.status==='success') alert('Settings saved and synced to Firebase!');"
-        " else alert('Failed to save');"
+        " if(d.status==='success') alert('✅ Settings saved and synced to Firebase!');"
+        " else alert('❌ Failed to save');"
         " }).catch(e=>alert('Error: '+e));"
         "}"
         "</script>"
         "</head><body>"
         "<div class='container'>"
-        "<h1 style='text-align:center'>ESP32 Configuration</h1>"
+        "<h1 style='text-align:center'>🌱 ESP32 Smart Irrigation</h1>"
+        "<div style='text-align:center;margin-bottom:20px'>"
+        "</div>"
         "<form method='POST' action='/config'>"
         "<div class='card'>"
         "<h2>📱 Device Configuration</h2>"
@@ -964,9 +1099,9 @@ void app_main(void) {
     
     load_config();
     
-    ESP_LOGI(TAG, "Starting in AP mode for configuration.");
+    ESP_LOGI(TAG, "🚀 Starting in AP mode for configuration.");
     wifi_init_ap();
     start_webserver();
     
-    ESP_LOGI(TAG, "System ready. Access http://192.168.4.1 to configure.");
+    ESP_LOGI(TAG, "✅ System ready. Access http://192.168.4.1 to configure.");
 }

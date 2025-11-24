@@ -4,7 +4,7 @@
       "config": {
         "auto_en": false,
         "dataCycle": 2000,
-        "pump_state": -1,
+        "pump_state": 0,
         "soil_max": 60,
         "soil_min": 40
       },
