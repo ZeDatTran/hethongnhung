@@ -99,7 +99,7 @@ static void firebase_get_config();
 
 // [MỚI] Hàm đồng bộ ngay lập tức (có delay tránh crash)
 static void sync_to_firebase_immediate() {
-    ESP_LOGI(TAG, "🔄 Immediate sync to Firebase triggered");
+    ESP_LOGI(TAG, " Immediate sync to Firebase triggered");
     firebase_push_data();
     vTaskDelay(pdMS_TO_TICKS(200)); // Delay nhỏ giữa 2 request
     firebase_push_config();
@@ -499,7 +499,7 @@ static void read_sensors() {
             break;
         } else {
             ESP_LOGE(TAG, "Failed to read DHT sensor (retry %d)", retries);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
     if (retries < 0) {
